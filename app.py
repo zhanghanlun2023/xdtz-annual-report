@@ -10,7 +10,6 @@ import sqlite3
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from pathlib import Path
 
-import pandas as pd
 import streamlit as st
 
 DB_PATH = Path(__file__).parent / "modern_investment.db"
@@ -439,6 +438,36 @@ def analyze_grid(rows):
     return col_pct, row_pct
 
 
+NAV_RE = re.compile(r'^(首页|前一页|后一页|上一页|下一页|PDF 第.*页)$')
+
+
+def _norm(s):
+    return re.sub(r'\s+', ' ', str(s)).strip()
+
+
+def is_nav_row(row):
+    """导航垃圾行：首页/前一页/后一页/PDF 第X页（含 HYPERLINK 形式）。"""
+    vals = [v for v in row if v is not None and str(v).strip() != '']
+    if not vals:
+        return False
+    return all(NAV_RE.match(_norm(clean_cell(v))) for v in vals)
+
+
+def clean_rows(rows):
+    """去掉空行、导航垃圾行与含"年度报告"的页眉行。"""
+    out = []
+    for r in rows:
+        vals = [v for v in r if v is not None and str(v).strip() != '']
+        if not vals:
+            continue
+        if is_nav_row(r):
+            continue
+        if any('年度报告' in _norm(clean_cell(v)) for v in vals):
+            continue
+        out.append(r)
+    return out
+
+
 def is_title_row(row):
     filled = [v for v in row if v is not None and str(v).strip() != '']
     if not filled or len(filled) > 2:
@@ -464,8 +493,8 @@ def trim_grid(rows):
 
 
 def render_grid(grid, factor):
-    """返回格式化后的显示矩阵（字符串），标题行合并为单格。"""
-    rows = trim_grid(grid)
+    """返回格式化后的显示矩阵（字符串），标题行合并为单格（用于 CSV 导出）。"""
+    rows = trim_grid(clean_rows(grid))
     col_pct, row_pct = analyze_grid(rows)
     out = []
     for r in rows:
@@ -482,39 +511,86 @@ def _is_num_str(s):
     return bool(s) and bool(re.match(r'^-?\d[\d,]*(?:\.\d+)?%?$', str(s)))
 
 
-def _row_styles(r):
-    vals = [v for v in r if str(v).strip() != '']
-    title = len(vals) == 1 and not _is_num_str(vals[0])
-    if title:
-        return ['font-weight: bold; color: #0a5c8c; text-align: center;' for _ in r]
-    return ['text-align: right;' if _is_num_str(v) else 'text-align: left;' for v in r]
+_XDTZ_CSS = """
+<style>
+.xdtz-wrap { overflow-x: auto; }
+table.xdtz { border-collapse: collapse; width: 100%;
+  font-family: 'Microsoft YaHei','PingFang SC','Segoe UI',sans-serif;
+  font-size: 13.5px; color: #23415c; background: #fff; }
+table.xdtz td, table.xdtz th { border: 1px solid #d7e6f1; padding: 6px 12px;
+  white-space: nowrap; text-align: left; }
+table.xdtz tr:nth-child(even) td { background: #f6fafd; }
+table.xdtz tr:hover td { background: #e8f4fb; }
+table.xdtz tr.xdtz-band td { background: linear-gradient(90deg,#0a5c8c,#1377b5);
+  color: #fff; font-weight: 700; text-align: center; font-size: 14px;
+  letter-spacing: 1px; border: none; border-bottom: 2px solid #0a5c8c;
+  padding: 9px 12px; }
+table.xdtz th.xdtz-head { background: #dcecf7; color: #0a3d5e;
+  font-weight: 700; text-align: center; }
+table.xdtz td.xdtz-item { background: #f2f8fc; color: #1a4668; font-weight: 700; }
+table.xdtz tr:nth-child(even) td.xdtz-item { background: #eaf3fa; }
+table.xdtz td.xdtz-num { text-align: right; font-variant-numeric: tabular-nums; }
+.xdtz-empty { color: #7a93a8; padding: 24px; text-align: center; font-size: 13px; }
+</style>
+"""
 
 
-def grid_to_html(rows):
+def esc_html(s):
+    return (str(s).replace('&', '&amp;').replace('<', '&lt;')
+            .replace('>', '&gt;').replace('"', '&quot;'))
+
+
+def render_table_html(grid, factor):
+    """久其式表格：蓝色标题带合并行、浅蓝表头、斑马纹、数字右对齐。"""
+    rows = clean_rows(grid)
     if not rows:
-        return "<p>无数据</p>"
+        return "<div class='xdtz-empty'>无数据</div>"
+    rows = trim_grid(rows)
+    if not rows:
+        return "<div class='xdtz-empty'>无数据</div>"
+    col_pct, _row_pct = analyze_grid(rows)
     n = max(len(r) for r in rows)
-    df = pd.DataFrame(rows, columns=[str(i) for i in range(n)])
-    html = (df.style
-            .hide(axis="index")
-            .hide(axis="columns")
-            .apply(_row_styles, axis=1)
-            .set_table_styles([
-                {'selector': 'tbody tr:nth-child(even)',
-                 'props': [('background-color', '#f5fafd')]},
-                {'selector': 'td',
-                 'props': [('border', '1px solid #d9e8f2'), ('padding', '4px 10px'),
-                           ('white-space', 'nowrap')]},
-            ]).to_html())
-    # 去掉空的 thead（隐藏数字列名表头）
-    html = re.sub(r'<thead>.*?</thead>', '', html, flags=re.S)
-    return html
+    seen_num = False
+    parts = [_XDTZ_CSS, "<div class='xdtz-wrap'><table class='xdtz'>"]
+    for r in rows:
+        vals = [v for v in r if v is not None and str(v).strip() != '']
+        if is_title_row(r):
+            text = '　'.join(str(v).strip() for v in vals)
+            parts.append(f"<tr class='xdtz-band'><td colspan='{n}'>{esc_html(text)}</td></tr>")
+            continue
+        filled_idx = next((j for j, v in enumerate(r) if v is not None and str(v).strip() != ''), 0)
+        # 表头行：数据出现前、≥2 格、全部非数字
+        if not seen_num and len(vals) >= 2 and not any(is_num(v) for v in vals):
+            cells = []
+            for j in range(n):
+                raw = r[j] if j < len(r) else None
+                v = fmt_cell(raw, col_pct[j], j == filled_idx, factor) if raw is not None else ''
+                cells.append(f"<th class='xdtz-head'>{esc_html(v or '')}</th>")
+            parts.append("<tr>" + "".join(cells) + "</tr>")
+            continue
+        if any(is_num(v) for v in vals):
+            seen_num = True
+        cells = []
+        for j in range(n):
+            raw = r[j] if j < len(r) else None
+            v = fmt_cell(raw, col_pct[j], j == filled_idx, factor) if raw is not None else ''
+            s = str(v or '')
+            if j == filled_idx:
+                cls = "xdtz-item"
+            elif _is_num_str(s):
+                cls = "xdtz-num"
+            else:
+                cls = "xdtz-txt"
+            cells.append(f"<td class='{cls}'>{esc_html(s)}</td>")
+        parts.append("<tr>" + "".join(cells) + "</tr>")
+    parts.append("</table></div>")
+    return "".join(parts)
 
 
 def grid_to_csv(rows):
     buf = io.StringIO()
     w = csv.writer(buf)
-    for r in rows:
+    for r in clean_rows(rows):
         w.writerow([v if v is not None else '' for v in r])
     return buf.getvalue().encode('utf-8-sig')
 
@@ -522,14 +598,26 @@ def grid_to_csv(rows):
 # ==================== 页面 ====================
 st.set_page_config(page_title="现代投资年报数据系统", layout="wide")
 
+TAB_LIMIT = 40
+
 years = get_years()
 if 'cur_year' not in st.session_state:
     st.session_state.cur_year = None
 if 'cur_sheet' not in st.session_state:
     st.session_state.cur_sheet = None
+if 'cur_sec' not in st.session_state:
+    st.session_state.cur_sec = None
+if 'mode' not in st.session_state:
+    st.session_state.mode = 'sec'
 
 with st.sidebar:
-    st.markdown("### 现代投资年报数据")
+    st.markdown("""
+    <div style="background:linear-gradient(135deg,#0a5c8c,#1b7fb8); border-radius:8px;
+                padding:10px 14px; margin-bottom:12px;">
+      <div style="color:#fff; font-weight:700; font-size:15px;">现代投资年报数据系统</div>
+      <div style="color:#cfe8f7; font-size:11px; margin-top:2px;">2022–2025 年报表格 · 久其式页签浏览</div>
+    </div>""", unsafe_allow_html=True)
+
     year = st.selectbox("年度", years, index=len(years) - 1, key="year_sel")
     unit = st.selectbox("单位", ["元", "万元", "亿元"], key="unit_sel")
     factor = {"元": 1, "万元": 1e4, "亿元": 1e8}[unit]
@@ -537,91 +625,143 @@ with st.sidebar:
     if st.session_state.cur_year != year:
         st.session_state.cur_year = year
         st.session_state.cur_sheet = None
+        st.session_state.cur_sec = None
+        st.session_state.mode = 'sec'
 
-    # 搜索
+    tree = get_tree(year)
+
+    # 搜索：直开单表（搜索优先于节视图；点节则切回节视图）
     q = st.text_input("搜索表格", key=f"q_{year}", placeholder="输入表名或标题关键词")
     if q.strip():
         matches = search_tables(year, q.strip())
         if matches:
-            labels = [m['display'] for m in matches]
+            labels, mapping = [], {}
+            for m in matches:
+                label = m['display']
+                if label in mapping:
+                    label = f"{label}（{m['sheet']}）"
+                mapping[label] = m['sheet']
+                labels.append(label)
+            prev_q = st.session_state.get(f"srch_q_{year}")
+            if q != prev_q:
+                st.session_state.pop(f"srch_{year}", None)
+                st.session_state.pop(f"srch_prev_{year}", None)
+                st.session_state.mode = 'srch'
+                st.session_state.cur_sheet = matches[0]['sheet']
+            st.session_state[f"srch_q_{year}"] = q
             prev = st.session_state.get(f"srch_prev_{year}")
             val = st.selectbox(
-                f"搜索结果（{len(matches)}）", labels, key=f"srch_{year}",
+                f"搜索结果（{len(labels)}）", labels, key=f"srch_{year}",
                 label_visibility="collapsed")
             if prev is not None and val != prev:
-                st.session_state.cur_sheet = matches[labels.index(val)]['sheet']
+                st.session_state.cur_sheet = mapping[val]
+                st.session_state.mode = 'srch'
             st.session_state[f"srch_prev_{year}"] = val
         else:
             st.caption("无匹配结果")
 
-    st.markdown("**章　节　目　录**")
-    tree = get_tree(year)
-    for ci, ch in enumerate(tree):
-        with st.expander(ch['chapter']):
-            options = []
-            mapping = {}
-            for s in ch['sections']:
-                for t in s['tables']:
-                    label = f"{s['name']} · {t['display']}"
-                    if label in mapping:
-                        label = f"{label}（{t['sheet']}）"
-                    mapping[label] = t['sheet']
-                    options.append(label)
-            if not options:
-                st.caption("无表格")
-                continue
-            prev = st.session_state.get(f"ch_prev_{year}_{ci}")
-            val = st.selectbox(
-                f"选择表格（{len(options)}）", options, key=f"ch_{year}_{ci}",
-                label_visibility="collapsed")
-            if prev is not None and val != prev and mapping[val] != st.session_state.cur_sheet:
-                st.session_state.cur_sheet = mapping[val]
-            st.session_state[f"ch_prev_{year}_{ci}"] = val
-
-    # 默认打开第一张表
-    if st.session_state.cur_sheet is None:
-        for ch in tree:
-            for s in ch['sections']:
-                if s['tables']:
-                    st.session_state.cur_sheet = s['tables'][0]['sheet']
-                    break
-            if st.session_state.cur_sheet is not None:
+    # 默认：第一节（须在章 expander 渲染前确定，保证活动章自动展开）
+    if st.session_state.cur_sec is None:
+        for ci, ch in enumerate(tree):
+            secs = [s for s in ch['sections'] if s['tables']]
+            if secs:
+                st.session_state.cur_sec = (ci, 0)
                 break
 
-sheet = st.session_state.cur_sheet
-if not sheet:
+    # 章节目录：点"节"后主区以横向页签展示该节全部表（久其式）
+    st.markdown("**章　节　目　录**")
+    for ci, ch in enumerate(tree):
+        secs = [s for s in ch['sections'] if s['tables']]
+        if not secs:
+            continue
+        active = st.session_state.cur_sec is not None and st.session_state.cur_sec[0] == ci
+        with st.expander(ch['chapter'], expanded=active):
+            options = [f"{s['name']}（{len(s['tables'])}）" for s in secs]
+            prev = st.session_state.get(f"sec_prev_{year}_{ci}")
+            val = st.radio("选择小节", options, key=f"sec_{year}_{ci}",
+                           label_visibility="collapsed")
+            if prev is not None and val != prev:
+                st.session_state.cur_sec = (ci, options.index(val))
+                st.session_state.cur_sheet = None
+                st.session_state.mode = 'sec'
+            st.session_state[f"sec_prev_{year}_{ci}"] = val
+
+
+def render_one(year, sheet, factor, big_title=True):
+    data = get_grid(year, sheet)
+    if not data:
+        st.error(f"未找到表格：{year} / {sheet}")
+        return
+    meta = (f"{year} 年 · {sheet} · 共 {data['rows']} 行 × {data['cols']} 列"
+            + (f" · PDF 第 {data['page'].strip()} 页" if data['page'] else ""))
+    if big_title:
+        st.markdown(f"### {data['display']}")
+        st.caption(meta)
+    c1, c2, c3 = st.columns([1, 1, 3])
+    with c1:
+        compare = st.toggle("跨年对比", key=f"cmp_{year}_{sheet}")
+    with c2:
+        st.download_button(
+            "导出 CSV", data=grid_to_csv(render_grid(data['grid'], factor)),
+            file_name=f"{year}_{sheet}.csv", mime="text/csv",
+            key=f"dl_{year}_{sheet}")
+    with c3:
+        if not big_title:
+            st.caption(meta)
+    if compare:
+        pairs = get_compare_list(sheet)
+        if len(pairs) <= 1:
+            st.info("未找到其他年度的同名表格。")
+        for (y, target) in pairs:
+            g = get_grid(y, target)
+            if not g:
+                continue
+            st.markdown(f"**{y} 年 · {target}**"
+                        + (f" · PDF 第 {g['page'].strip()} 页" if g['page'] else ""))
+            st.html(render_table_html(g['grid'], factor))
+    else:
+        st.html(render_table_html(data['grid'], factor))
+
+
+def render_section(year, factor, ch, sec):
+    """节下 1 表直开；≤40 表横向页签；>40 表下拉。"""
+    tables = sec['tables']
+    if len(tables) == 1:
+        render_one(year, tables[0]['sheet'], factor, big_title=True)
+        return
+    labels, mapping = [], {}
+    for t in tables:
+        label = t['display']
+        if label in mapping:
+            label = f"{label}（{t['sheet']}）"
+        mapping[label] = t['sheet']
+        labels.append(label)
+    if len(tables) <= TAB_LIMIT:
+        tabs = st.tabs(labels)
+        for tab, t in zip(tabs, tables):
+            with tab:
+                render_one(year, t['sheet'], factor, big_title=False)
+    else:
+        val = st.selectbox(f"本节共 {len(labels)} 张表，请选择", labels,
+                           key=f"big_{year}_{ch}_{sec['name']}")
+        render_one(year, mapping[val], factor, big_title=True)
+
+
+# ==================== 主区域 ====================
+if not tree:
     st.info("数据库中暂无该年度表格。")
     st.stop()
 
-data = get_grid(year, sheet)
-if not data:
-    st.error(f"未找到表格：{year} / {sheet}")
-    st.stop()
-
-# 主区域
-st.markdown(f"## {data['display']}")
-st.caption(f"{year} 年 · {sheet} · 共 {data['rows']} 行 × {data['cols']} 列"
-           + (f" · PDF 第 {data['page'].strip()} 页" if data['page'] else ""))
-
-col1, col2, col3 = st.columns([1, 1, 4])
-with col1:
-    compare = st.toggle("跨年对比", key=f"cmp_{year}_{sheet}")
-with col2:
-    st.download_button(
-        "导出 CSV", data=grid_to_csv(render_grid(data['grid'], factor)),
-        file_name=f"{year}_{sheet}.csv", mime="text/csv",
-        key=f"dl_{year}_{sheet}")
-
-if compare:
-    pairs = get_compare_list(sheet)
-    if len(pairs) <= 1:
-        st.info("未找到其他年度的同名表格。")
-    for (y, target) in pairs:
-        g = get_grid(y, target)
-        if not g:
-            continue
-        st.markdown(f"#### {y} 年 · {target}"
-                    + (f" · PDF 第 {g['page'].strip()} 页" if g['page'] else ""))
-        st.html(grid_to_html(render_grid(g['grid'], factor)))
+if st.session_state.mode == 'srch' and q.strip() and st.session_state.cur_sheet:
+    # 搜索模式：直开单表
+    render_one(year, st.session_state.cur_sheet, factor, big_title=True)
 else:
-    st.html(grid_to_html(render_grid(data['grid'], factor)))
+    if st.session_state.cur_sec is None:
+        st.info("数据库中暂无该年度表格。")
+        st.stop()
+    ci, si = st.session_state.cur_sec
+    ch = tree[ci]
+    secs = [s for s in ch['sections'] if s['tables']]
+    sec = secs[min(si, len(secs) - 1)]
+    st.markdown(f"### {ch['chapter']} · {sec['name']}")
+    render_section(year, factor, ch, sec)
