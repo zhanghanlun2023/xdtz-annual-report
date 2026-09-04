@@ -535,6 +535,7 @@ def _is_num_str(s):
 _XDTZ_CSS = """
 <style>
 .xdtz-wrap { overflow-x: auto; }
+.xdtz-wrap.xdtz-long { max-height: 72vh; overflow-y: auto; }
 table.xdtz { border-collapse: collapse; width: 100%;
   font-family: 'Microsoft YaHei','PingFang SC','Segoe UI',sans-serif;
   font-size: 13.5px; color: #23415c; background: #fff; }
@@ -548,9 +549,15 @@ table.xdtz tr.xdtz-band td { background: linear-gradient(90deg,#0a5c8c,#1377b5);
   padding: 9px 12px; }
 table.xdtz th.xdtz-head { background: #dcecf7; color: #0a3d5e;
   font-weight: 700; text-align: center; }
+/* 长表仅冻结表头；页面标题、筛选器等非表格区域正常随页面滚动。 */
+.xdtz-long table.xdtz th.xdtz-head { position: sticky; top: 0; z-index: 3;
+  box-shadow: 0 1px 0 #b8d3e6; }
 table.xdtz td.xdtz-item { background: #f2f8fc; color: #1a4668; font-weight: 700; }
 table.xdtz tr:nth-child(even) td.xdtz-item { background: #eaf3fa; }
-table.xdtz td.xdtz-num { text-align: right; font-variant-numeric: tabular-nums; }
+/* 数据表：表头和全部数据居中；文字说明表：表头居中、正文左对齐。 */
+table.xdtz.xdtz-data td { text-align: center; }
+table.xdtz.xdtz-data td.xdtz-num { text-align: center; font-variant-numeric: tabular-nums; }
+table.xdtz.xdtz-text td { text-align: left; }
 .xdtz-empty { color: #7a93a8; padding: 24px; text-align: center; font-size: 13px; }
 </style>
 """
@@ -572,7 +579,15 @@ def render_table_html(grid, factor):
     col_pct, _row_pct = analyze_grid(rows)
     n = max(len(r) for r in rows)
     seen_num = False
-    parts = [_XDTZ_CSS, "<div class='xdtz-wrap'><table class='xdtz'>"]
+    # 两个及以上数值单元格视为数据表；说明性/人员信息等表格按文字表处理。
+    numeric_cells = sum(
+        1 for r in rows if not is_title_row(r)
+        for v in r if v is not None and str(v).strip() != '' and is_num(v)
+    )
+    table_kind = 'xdtz-data' if numeric_cells >= 2 else 'xdtz-text'
+    wrap_kind = ' xdtz-long' if len(rows) > 18 else ''
+    parts = [_XDTZ_CSS,
+             f"<div class='xdtz-wrap{wrap_kind}'><table class='xdtz {table_kind}'>"]
     for r in rows:
         vals = [v for v in r if v is not None and str(v).strip() != '']
         if is_title_row(r):
